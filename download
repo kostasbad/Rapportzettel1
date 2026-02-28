@@ -1,0 +1,615 @@
+import { useState, useRef, useEffect } from "react";
+
+const TRADES = [
+  { id: "electrician", label: "Ηλεκτρολόγος", de: "Elektriker", icon: "⚡" },
+  { id: "plumber", label: "Υδραυλικός", de: "Klempner", icon: "🔧" },
+  { id: "painter", label: "Μπογιατζής", de: "Maler", icon: "🎨" },
+  { id: "carpenter", label: "Ξυλουργός", de: "Schreiner", icon: "🪚" },
+  { id: "hvac", label: "Ψυκτικός", de: "Kältetechniker", icon: "❄️" },
+  { id: "general", label: "Γενικά", de: "Allgemein", icon: "🏠" },
+];
+const UNITS = ["Stk.", "m", "m²", "kg", "Liter", "Rolle", "Dose", "Paket", "Set"];
+
+function fmtDate(d) {
+  return new Intl.DateTimeFormat("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(d));
+}
+function nowTime() {
+  const n = new Date();
+  return `${String(n.getHours()).padStart(2, "0")}:${String(n.getMinutes()).padStart(2, "0")}`;
+}
+
+// ─── localStorage helpers ───
+function loadReports() {
+  try { return JSON.parse(localStorage.getItem("rapports") || "[]"); }
+  catch { return []; }
+}
+function saveReports(reports) {
+  try { localStorage.setItem("rapports", JSON.stringify(reports)); }
+  catch (e) { console.error("Save error:", e); }
+}
+function loadApiKey() {
+  return localStorage.getItem("anthropic_api_key") || "";
+}
+function saveApiKey(key) {
+  localStorage.setItem("anthropic_api_key", key);
+}
+
+export default function App() {
+  const [screen, setScreen] = useState("home");
+  const [trade, setTrade] = useState(null);
+  const [customer, setCustomer] = useState("");
+  const [address, setAddress] = useState("");
+  const [projectNr, setProjectNr] = useState("");
+  const [arrival, setArrival] = useState("");
+  const [departure, setDeparture] = useState("");
+  const [beforePhotos, setBeforePhotos] = useState([]);
+  const [afterPhotos, setAfterPhotos] = useState([]);
+  const [greekNotes, setGreekNotes] = useState("");
+  const [materials, setMaterials] = useState([{ name: "", qty: "", unit: "Stk." }]);
+  const [report, setReport] = useState(null);
+  const [error, setError] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [copied, setCopied] = useState(false);
+  const [editingReport, setEditingReport] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [apiKey, setApiKey] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [tempKey, setTempKey] = useState("");
+  const beforeRef = useRef(null);
+  const afterRef = useRef(null);
+
+  useEffect(() => {
+    setHistory(loadReports());
+    const k = loadApiKey();
+    setApiKey(k);
+    if (!k) setShowSettings(true);
+  }, []);
+
+  const handlePhotos = (e, setter) => {
+    Array.from(e.target.files).forEach(f => {
+      const r = new FileReader();
+      r.onloadend = () => setter(prev => [...prev, r.result]);
+      r.readAsDataURL(f);
+    });
+    e.target.value = "";
+  };
+  const removePhoto = (setter, idx) => setter(prev => prev.filter((_, i) => i !== idx));
+  const addMat = () => setMaterials([...materials, { name: "", qty: "", unit: "Stk." }]);
+  const updMat = (i, k, v) => { const m = [...materials]; m[i][k] = v; setMaterials(m); };
+  const delMat = (i) => materials.length > 1 ? setMaterials(materials.filter((_, idx) => idx !== i)) : updMat(0, "name", "");
+  const matStr = materials.filter(m => m.name.trim()).map(m => `${m.qty} ${m.unit} ${m.name}`).join(", ");
+
+  const generate = async () => {
+    if (!apiKey) { setError("Βάλε πρώτα το API Key στις ρυθμίσεις ⚙️"); return; }
+    setScreen("loading");
+    setError(null);
+    const sel = TRADES.find(t => t.id === trade);
+    const prompt = `Du bist ein erfahrener ${sel?.de || "Handwerker"} in Deutschland. Schreibe eine kurze Tätigkeitsbeschreibung für einen Rapportzettel.
+
+EINGABE (Griechisch vom Handwerker):
+"${greekNotes}"
+
+${matStr ? `Verwendetes Material: ${matStr}` : ""}
+
+REGELN:
+- NUR die Tätigkeitsbeschreibung, 2-4 kurze Sätze
+- Wie auf einem ECHTEN Rapportzettel — kurz, sachlich, professionell
+- Korrekte deutsche Fachbegriffe für ${sel?.de || "Handwerk"}
+- Nenne Material wenn angegeben
+- Nenne Grund (defekt, veraltet, Kundenwunsch, etc.)
+- KEINE Überschriften, KEINE Abschnitte, KEIN Header
+- KEINE Anrede, KEINE Grußformel
+- Maximal 4 Sätze
+
+Beispiel:
+"Defekte Steckdose in der Küche demontiert und durch neue Busch-Jaeger UP-Steckdose ersetzt. Anschluss geprüft, Funktion einwandfrei."
+
+Antworte NUR mit der Tätigkeitsbeschreibung.`;
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 500,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error?.message || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const txt = data.content?.map(i => i.type === "text" ? i.text : "").filter(Boolean).join("\n");
+      if (txt) {
+        const r = {
+          id: Date.now(), date: new Date().toISOString(), trade: sel, customer, address,
+          projectNr, arrival, departure, greekNotes,
+          materials: materials.filter(m => m.name.trim()),
+          text: txt.trim(),
+          beforePhotoCount: beforePhotos.length,
+          afterPhotoCount: afterPhotos.length,
+          // store thumbnails (smaller) for history, full photos only in current session
+          beforePhotos, afterPhotos,
+        };
+        setReport(r);
+        // Save without full photo data (too large for localStorage)
+        const forStorage = { ...r, beforePhotos: [], afterPhotos: [] };
+        const updated = [forStorage, ...history];
+        setHistory(updated);
+        saveReports(updated);
+        setScreen("report");
+      } else {
+        setError("Δεν ήρθε απάντηση — δοκίμασε ξανά.");
+        setScreen("form");
+      }
+    } catch (err) {
+      setError("Σφάλμα: " + err.message);
+      setScreen("form");
+    }
+  };
+
+  const deleteReport = (id) => {
+    const updated = history.filter(h => h.id !== id);
+    setHistory(updated); saveReports(updated);
+    setConfirmDelete(null);
+    if (report?.id === id) { setReport(null); setScreen("home"); }
+  };
+
+  const buildText = (r) => {
+    const mats = r.materials?.length ? r.materials.map(m => `  • ${m.qty} ${m.unit} ${m.name}`).join("\n") : "–";
+    return `Rapport — ${r.trade?.de || "Handwerk"}
+━━━━━━━━━━━━━━━━━━━━━━
+Datum:       ${fmtDate(r.date)}
+Kunde:       ${r.customer || "–"}
+Adresse:     ${r.address || "–"}${r.projectNr ? `\nProjekt-Nr.: ${r.projectNr}` : ""}
+Ankunft:     ${r.arrival || "–"}
+Abfahrt:     ${r.departure || "–"}
+━━━━━━━━━━━━━━━━━━━━━━
+
+Tätigkeit:
+${r.text}
+${r.materials?.length ? `\nMaterial:\n${mats}` : ""}`;
+  };
+
+  const copyText = (r) => {
+    navigator.clipboard?.writeText(buildText(r));
+    setCopied(true); setTimeout(() => setCopied(false), 2000);
+  };
+
+  const shareReport = async (r) => {
+    const text = buildText(r);
+    if (navigator.share) {
+      try { await navigator.share({ title: `Rapport — ${r.trade?.de}`, text }); }
+      catch {}
+    } else {
+      copyText(r);
+    }
+  };
+
+  const reset = () => {
+    setTrade(null); setCustomer(""); setAddress(""); setProjectNr("");
+    setArrival(""); setDeparture(""); setBeforePhotos([]); setAfterPhotos([]);
+    setGreekNotes(""); setMaterials([{ name: "", qty: "", unit: "Stk." }]);
+    setReport(null); setError(null); setEditingReport(false); setScreen("home");
+  };
+
+  // ─── DESIGN ───
+  const C = { bg: "#f0ece4", card: "#fff", accent: "#c47a0a", accentBg: "#fef7ec", text: "#1c1917", dim: "#78716c", border: "#e7e5e4", red: "#b91c1c", green: "#15803d" };
+  const S = {
+    page: { minHeight: "100vh", minHeight: "100dvh", background: C.bg, fontFamily: "'IBM Plex Sans', sans-serif", color: C.text },
+    wrap: { maxWidth: "500px", margin: "0 auto", padding: "16px 14px", paddingBottom: "32px" },
+    card: { background: C.card, borderRadius: "10px", padding: "14px", border: `1px solid ${C.border}`, marginBottom: "10px" },
+    label: { display: "block", marginBottom: "5px", fontSize: "11px", fontWeight: "600", color: C.dim, textTransform: "uppercase", letterSpacing: "0.4px" },
+    input: { width: "100%", padding: "9px 10px", background: "#fafaf9", border: `1px solid ${C.border}`, borderRadius: "7px", color: C.text, fontSize: "14px", fontFamily: "inherit", outline: "none", boxSizing: "border-box" },
+    btn: { border: "none", borderRadius: "8px", padding: "11px 20px", fontSize: "14px", fontWeight: "600", cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" },
+  };
+
+  const PhotoGrid = ({ photos, onRemove, color }) => (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+      {photos.map((p, i) => (
+        <div key={i} style={{ position: "relative", width: "72px", height: "72px", borderRadius: "6px", overflow: "hidden", border: `2px solid ${color}44` }}>
+          <img src={p} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          {onRemove && (
+            <button onClick={() => onRemove(i)} style={{
+              position: "absolute", top: "2px", right: "2px", width: "20px", height: "20px",
+              borderRadius: "50%", background: "rgba(0,0,0,0.6)", color: "#fff",
+              border: "none", fontSize: "12px", cursor: "pointer", display: "flex",
+              alignItems: "center", justifyContent: "center",
+            }}>×</button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+
+  // ─── SETTINGS MODAL ───
+  const SettingsModal = () => (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 999, display: "flex", alignItems: "center", justifyContent: "center", padding: "20px" }}
+      onClick={() => apiKey && setShowSettings(false)}>
+      <div style={{ background: C.card, borderRadius: "16px", padding: "24px", maxWidth: "420px", width: "100%" }}
+        onClick={e => e.stopPropagation()}>
+        <h3 style={{ margin: "0 0 4px", fontSize: "17px" }}>⚙️ Ρυθμίσεις</h3>
+        <p style={{ fontSize: "13px", color: C.dim, margin: "0 0 16px" }}>
+          Χρειάζεσαι ένα Anthropic API Key για να δουλέψει το AI.
+        </p>
+        <label style={S.label}>Anthropic API Key</label>
+        <input type="password" value={tempKey}
+          onChange={e => setTempKey(e.target.value)}
+          placeholder="sk-ant-api03-..."
+          style={{ ...S.input, marginBottom: "8px" }} />
+        <div style={{ fontSize: "11px", color: C.dim, marginBottom: "16px" }}>
+          Πάρε κλειδί από{" "}
+          <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style={{ color: C.accent }}>
+            console.anthropic.com
+          </a>
+          . Αποθηκεύεται μόνο στο κινητό σου.
+        </div>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button onClick={() => { saveApiKey(tempKey); setApiKey(tempKey); setShowSettings(false); }}
+            disabled={!tempKey.trim()}
+            style={{
+              ...S.btn, flex: 1, background: tempKey.trim() ? C.accent : "#d6d3d1",
+              color: tempKey.trim() ? "#fff" : "#a8a29e",
+            }}>Αποθήκευση</button>
+          {apiKey && (
+            <button onClick={() => setShowSettings(false)}
+              style={{ ...S.btn, background: "#eee", color: C.dim }}>Κλείσιμο</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  // ─── HOME ───
+  if (screen === "home") {
+    return (
+      <div style={S.page}>
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@700&display=swap" rel="stylesheet" />
+        {showSettings && <SettingsModal />}
+        <div style={S.wrap}>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "-8px" }}>
+            <button onClick={() => { setTempKey(apiKey); setShowSettings(true); }}
+              style={{ ...S.btn, background: "transparent", color: C.dim, padding: "6px", fontSize: "18px" }}>⚙️</button>
+          </div>
+          <div style={{ textAlign: "center", padding: "20px 0 24px" }}>
+            <div style={{ fontSize: "38px", marginBottom: "10px" }}>📋</div>
+            <h1 style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "22px", margin: "0 0 4px", fontWeight: "700" }}>
+              RAPPORT<span style={{ color: C.accent }}>ZETTEL</span>
+            </h1>
+            <p style={{ color: C.dim, fontSize: "13px", margin: 0 }}>Γράψε ελληνικά → Rapport γερμανικά</p>
+          </div>
+
+          <button onClick={() => { if (!apiKey) { setTempKey(""); setShowSettings(true); } else setScreen("form"); }}
+            style={{ ...S.btn, width: "100%", padding: "14px", fontSize: "15px", background: C.accent, color: "#fff", boxShadow: "0 2px 8px rgba(196,122,10,0.25)" }}>
+            ＋ Νέα Εργασία
+          </button>
+
+          {history.length > 0 && (
+            <>
+              <div style={{ fontSize: "11px", fontWeight: "600", color: C.dim, textTransform: "uppercase", letterSpacing: "0.5px", margin: "24px 0 10px" }}>
+                Αποθηκευμένα ({history.length})
+              </div>
+              {history.map(h => (
+                <div key={h.id} style={{ ...S.card, position: "relative" }}>
+                  <div onClick={() => { setReport(h); setScreen("report"); }}
+                    style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                      <span style={{ fontSize: "20px" }}>{h.trade?.icon}</span>
+                      <div>
+                        <div style={{ fontSize: "14px", fontWeight: "600" }}>{h.customer || "–"}</div>
+                        <div style={{ fontSize: "12px", color: C.dim }}>{h.trade?.label} · {h.arrival || "–"}–{h.departure || "–"}</div>
+                        <div style={{ fontSize: "11px", color: C.dim, marginTop: "1px", maxWidth: "240px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.text}</div>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: "12px", color: C.dim, textAlign: "right", flexShrink: 0 }}>{fmtDate(h.date)}</div>
+                  </div>
+                  {confirmDelete === h.id ? (
+                    <div style={{ display: "flex", gap: "6px", marginTop: "8px", paddingTop: "8px", borderTop: `1px solid ${C.border}` }}>
+                      <button onClick={() => deleteReport(h.id)} style={{ ...S.btn, background: C.red, color: "#fff", padding: "6px 14px", fontSize: "12px" }}>Διαγραφή</button>
+                      <button onClick={() => setConfirmDelete(null)} style={{ ...S.btn, background: "#eee", color: C.dim, padding: "6px 14px", fontSize: "12px" }}>Ακύρωση</button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setConfirmDelete(h.id)}
+                      style={{ position: "absolute", top: "10px", right: "10px", background: "transparent", border: "none", color: "#ccc", cursor: "pointer", fontSize: "14px", padding: "4px" }}>🗑</button>
+                  )}
+                </div>
+              ))}
+            </>
+          )}
+
+          <div style={{ marginTop: "24px", padding: "14px", background: C.accentBg, borderRadius: "10px", border: `1px solid #f5deb3` }}>
+            <div style={{ fontSize: "13px", fontWeight: "600", marginBottom: "8px" }}>Πώς δουλεύει:</div>
+            {["Στοιχεία πελάτη & ώρες εργασίας", "Φωτό πριν & μετά (όσες θέλεις)", "Γράψε τι έκανες στα ελληνικά", "Πρόσθεσε υλικά", "AI → σύντομο Rapport γερμανικά", "Copy/Share οπουδήποτε"].map((t, i) => (
+              <div key={i} style={{ fontSize: "13px", padding: "2px 0", display: "flex", gap: "8px" }}>
+                <span style={{ color: C.accent, fontWeight: "700", minWidth: "18px" }}>{i + 1}.</span> {t}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── LOADING ───
+  if (screen === "loading") {
+    return (
+      <div style={{ ...S.page, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+        <div style={{ textAlign: "center" }}>
+          <div style={{ width: "48px", height: "48px", borderRadius: "50%", border: `3px solid ${C.border}`, borderTopColor: C.accent, animation: "spin 0.8s linear infinite", margin: "0 auto 16px" }} />
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+          <p style={{ fontSize: "14px", color: C.dim }}>Rapport wird erstellt...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── REPORT ───
+  if (screen === "report" && report) {
+    return (
+      <div style={S.page}>
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@700&display=swap" rel="stylesheet" />
+        <div style={S.wrap}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+            <button onClick={reset} style={{ ...S.btn, background: "transparent", color: C.dim, padding: "6px 0", fontSize: "13px" }}>← Αρχική</button>
+            <span style={{ fontSize: "12px", color: C.dim }}>{fmtDate(report.date)}</span>
+          </div>
+
+          <div style={{ ...S.card, border: `1px solid ${C.accent}44` }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px", paddingBottom: "10px", borderBottom: `1px solid ${C.border}` }}>
+              <span style={{ fontSize: "22px" }}>{report.trade?.icon}</span>
+              <div>
+                <div style={{ fontWeight: "700", fontSize: "15px" }}>Rapport — {report.trade?.de}</div>
+                <div style={{ fontSize: "12px", color: C.dim }}>{report.customer}{report.address ? ` · ${report.address}` : ""}</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", marginBottom: "12px", fontSize: "13px" }}>
+              {report.arrival && <div><span style={{ color: C.dim }}>Ankunft:</span> <strong>{report.arrival}</strong></div>}
+              {report.departure && <div><span style={{ color: C.dim }}>Abfahrt:</span> <strong>{report.departure}</strong></div>}
+              {report.projectNr && <div><span style={{ color: C.dim }}>Projekt:</span> <strong>{report.projectNr}</strong></div>}
+            </div>
+
+            {/* Photos */}
+            {report.beforePhotos?.length > 0 && report.beforePhotos[0]?.startsWith?.("data:") && (
+              <div style={{ marginBottom: "10px" }}>
+                <div style={{ fontSize: "10px", fontWeight: "700", color: C.red, textTransform: "uppercase", marginBottom: "4px" }}>📸 Vorher ({report.beforePhotos.length})</div>
+                <PhotoGrid photos={report.beforePhotos} color={C.red} />
+              </div>
+            )}
+            {report.afterPhotos?.length > 0 && report.afterPhotos[0]?.startsWith?.("data:") && (
+              <div style={{ marginBottom: "10px" }}>
+                <div style={{ fontSize: "10px", fontWeight: "700", color: C.green, textTransform: "uppercase", marginBottom: "4px" }}>📸 Nachher ({report.afterPhotos.length})</div>
+                <PhotoGrid photos={report.afterPhotos} color={C.green} />
+              </div>
+            )}
+
+            {/* Tätigkeit */}
+            <div style={{ marginBottom: "12px" }}>
+              <div style={S.label}>Tätigkeit</div>
+              {editingReport ? (
+                <div>
+                  <textarea value={editText} onChange={e => setEditText(e.target.value)} rows={4} style={{ ...S.input, resize: "vertical", lineHeight: "1.5" }} />
+                  <div style={{ display: "flex", gap: "8px", marginTop: "6px" }}>
+                    <button onClick={() => {
+                      const u = { ...report, text: editText };
+                      setReport(u);
+                      const uh = history.map(x => x.id === u.id ? { ...u, beforePhotos: [], afterPhotos: [] } : x);
+                      setHistory(uh); saveReports(uh);
+                      setEditingReport(false);
+                    }} style={{ ...S.btn, background: C.green, color: "#fff", padding: "6px 14px", fontSize: "12px" }}>✓ OK</button>
+                    <button onClick={() => setEditingReport(false)} style={{ ...S.btn, background: "#eee", color: C.dim, padding: "6px 14px", fontSize: "12px" }}>Ακύρωση</button>
+                  </div>
+                </div>
+              ) : (
+                <div onClick={() => { setEditText(report.text); setEditingReport(true); }}
+                  style={{ fontSize: "14px", lineHeight: "1.6", cursor: "pointer", padding: "8px", background: "#fafaf9", borderRadius: "6px", border: `1px dashed ${C.border}` }}>
+                  {report.text}
+                  <div style={{ fontSize: "10px", color: C.dim, marginTop: "4px" }}>✏️ κλικ για edit</div>
+                </div>
+              )}
+            </div>
+
+            {report.materials?.length > 0 && (
+              <div style={{ marginBottom: "10px" }}>
+                <div style={S.label}>Material</div>
+                <div style={{ fontSize: "13px", lineHeight: "1.6" }}>
+                  {report.materials.map((m, i) => <div key={i}>• {m.qty} {m.unit} {m.name}</div>)}
+                </div>
+              </div>
+            )}
+
+            <div style={{ padding: "8px 10px", background: "#f5f5f4", borderRadius: "6px", fontSize: "12px", color: C.dim }}>
+              <span style={{ fontWeight: "600" }}>🇬🇷</span> {report.greekNotes}
+            </div>
+          </div>
+
+          {/* Preview */}
+          <div style={{ ...S.card, background: "#fffdf7", border: `1px solid ${C.accent}33` }}>
+            <div style={{ ...S.label, margin: "0 0 8px" }}>📄 Vorschau</div>
+            <div style={{ fontSize: "13px", lineHeight: "1.7", padding: "12px", background: "#fff", borderRadius: "6px", border: `1px solid ${C.border}`, whiteSpace: "pre-wrap", userSelect: "text" }}>
+              {buildText(report)}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+            <button onClick={() => copyText(report)} style={{
+              ...S.btn, flex: 1, background: copied ? C.green : C.accent, color: "#fff",
+            }}>{copied ? "✓ Kopiert!" : "📋 Αντιγραφή"}</button>
+            <button onClick={() => shareReport(report)} style={{
+              ...S.btn, background: C.card, color: C.text, border: `1px solid ${C.border}`,
+            }}>📤 Share</button>
+            <button onClick={reset} style={{ ...S.btn, background: C.card, color: C.text, border: `1px solid ${C.border}` }}>＋ Νέα</button>
+          </div>
+          <div style={{ fontSize: "11px", color: C.dim, textAlign: "center" }}>Asana · Email · WhatsApp · οπουδήποτε</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── FORM ───
+  return (
+    <div style={S.page}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@700&display=swap" rel="stylesheet" />
+      {showSettings && <SettingsModal />}
+      <div style={S.wrap}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
+          <button onClick={reset} style={{ ...S.btn, background: "transparent", color: C.dim, padding: "6px 0", fontSize: "13px" }}>← Πίσω</button>
+          <span style={{ fontSize: "15px", fontWeight: "700" }}>Neuer Rapport</span>
+          <button onClick={() => { setTempKey(apiKey); setShowSettings(true); }}
+            style={{ ...S.btn, background: "transparent", color: C.dim, padding: "6px", fontSize: "16px" }}>⚙️</button>
+        </div>
+
+        {error && (
+          <div style={{ background: "#fef2f2", border: `1px solid #fecaca`, borderRadius: "8px", padding: "10px", marginBottom: "10px", fontSize: "13px", color: C.red }}>{error}</div>
+        )}
+
+        {/* Trade */}
+        <div style={S.card}>
+          <div style={S.label}>Beruf / Επάγγελμα</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "6px" }}>
+            {TRADES.map(t => (
+              <button key={t.id} onClick={() => setTrade(t.id)} style={{
+                background: trade === t.id ? C.accentBg : "#fafaf9",
+                border: `2px solid ${trade === t.id ? C.accent : C.border}`,
+                borderRadius: "8px", padding: "10px 4px", cursor: "pointer",
+                textAlign: "center", color: C.text, fontFamily: "inherit",
+              }}>
+                <div style={{ fontSize: "18px" }}>{t.icon}</div>
+                <div style={{ fontSize: "10px", fontWeight: "600", marginTop: "2px" }}>{t.label}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Customer */}
+        <div style={S.card}>
+          <div style={{ marginBottom: "10px" }}>
+            <label style={S.label}>Kunde / Πελάτης</label>
+            <input type="text" value={customer} onChange={e => setCustomer(e.target.value)} placeholder="z.B. Fam. Müller" style={S.input} />
+          </div>
+          <div style={{ marginBottom: "10px" }}>
+            <label style={S.label}>Adresse / Διεύθυνση</label>
+            <input type="text" value={address} onChange={e => setAddress(e.target.value)} placeholder="z.B. Hauptstr. 15, Stuttgart" style={S.input} />
+          </div>
+          <div>
+            <label style={S.label}>Projekt-Nr. (προαιρετικό)</label>
+            <input type="text" value={projectNr} onChange={e => setProjectNr(e.target.value)} placeholder="z.B. P-2026-042" style={S.input} />
+          </div>
+        </div>
+
+        {/* Times with NOW buttons */}
+        <div style={S.card}>
+          <div style={S.label}>🕐 Arbeitszeit</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+            <div>
+              <label style={{ ...S.label, fontSize: "10px" }}>Ankunft / Άφιξη</label>
+              <div style={{ display: "flex", gap: "4px" }}>
+                <input type="time" value={arrival} onChange={e => setArrival(e.target.value)} style={{ ...S.input, flex: 1 }} />
+                <button onClick={() => setArrival(nowTime())}
+                  style={{ ...S.btn, background: C.accentBg, color: C.accent, padding: "6px 8px", fontSize: "11px", border: `1px solid ${C.accent}44`, whiteSpace: "nowrap", flexShrink: 0 }}>Τώρα</button>
+              </div>
+            </div>
+            <div>
+              <label style={{ ...S.label, fontSize: "10px" }}>Abfahrt / Αναχώρηση</label>
+              <div style={{ display: "flex", gap: "4px" }}>
+                <input type="time" value={departure} onChange={e => setDeparture(e.target.value)} style={{ ...S.input, flex: 1 }} />
+                <button onClick={() => setDeparture(nowTime())}
+                  style={{ ...S.btn, background: C.accentBg, color: C.accent, padding: "6px 8px", fontSize: "11px", border: `1px solid ${C.accent}44`, whiteSpace: "nowrap", flexShrink: 0 }}>Τώρα</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Photos */}
+        <div style={S.card}>
+          <div style={S.label}>📸 Fotos</div>
+          <div style={{ marginBottom: "10px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+              <span style={{ fontSize: "12px", fontWeight: "600", color: C.red }}>VORHER / ΠΡΙΝ</span>
+              <button onClick={() => beforeRef.current?.click()} style={{
+                ...S.btn, background: `${C.red}11`, color: C.red, padding: "4px 10px", fontSize: "12px", border: `1px solid ${C.red}33`,
+              }}>+ Φωτό</button>
+            </div>
+            <input ref={beforeRef} type="file" accept="image/*" capture="environment" multiple
+              onChange={e => handlePhotos(e, setBeforePhotos)} style={{ display: "none" }} />
+            {beforePhotos.length > 0 ? (
+              <PhotoGrid photos={beforePhotos} onRemove={(i) => removePhoto(setBeforePhotos, i)} color={C.red} />
+            ) : (
+              <div onClick={() => beforeRef.current?.click()} style={{
+                height: "56px", borderRadius: "8px", cursor: "pointer", background: "#fafaf9",
+                border: `2px dashed ${C.border}`, display: "flex", alignItems: "center",
+                justifyContent: "center", fontSize: "12px", color: C.dim,
+              }}>📸 Πάτα για φωτογραφίες πριν</div>
+            )}
+          </div>
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+              <span style={{ fontSize: "12px", fontWeight: "600", color: C.green }}>NACHHER / ΜΕΤΑ</span>
+              <button onClick={() => afterRef.current?.click()} style={{
+                ...S.btn, background: `${C.green}11`, color: C.green, padding: "4px 10px", fontSize: "12px", border: `1px solid ${C.green}33`,
+              }}>+ Φωτό</button>
+            </div>
+            <input ref={afterRef} type="file" accept="image/*" capture="environment" multiple
+              onChange={e => handlePhotos(e, setAfterPhotos)} style={{ display: "none" }} />
+            {afterPhotos.length > 0 ? (
+              <PhotoGrid photos={afterPhotos} onRemove={(i) => removePhoto(setAfterPhotos, i)} color={C.green} />
+            ) : (
+              <div onClick={() => afterRef.current?.click()} style={{
+                height: "56px", borderRadius: "8px", cursor: "pointer", background: "#fafaf9",
+                border: `2px dashed ${C.border}`, display: "flex", alignItems: "center",
+                justifyContent: "center", fontSize: "12px", color: C.dim,
+              }}>📸 Πάτα για φωτογραφίες μετά</div>
+            )}
+          </div>
+        </div>
+
+        {/* Greek notes */}
+        <div style={S.card}>
+          <label style={S.label}>✍️ Τι έκανες; (ελληνικά)</label>
+          <textarea value={greekNotes} onChange={e => setGreekNotes(e.target.value)}
+            placeholder="π.χ. Άλλαξα μια μπρίζα στην κουζίνα, ήταν χαλασμένη"
+            rows={3} style={{ ...S.input, resize: "vertical", lineHeight: "1.5" }} />
+          <div style={{ fontSize: "11px", color: C.dim, marginTop: "4px" }}>Σύντομα — AI μεταφράζει & βάζει τεχνικούς όρους</div>
+        </div>
+
+        {/* Materials */}
+        <div style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+            <div style={S.label}>🔩 Material</div>
+            <button onClick={addMat} style={{ ...S.btn, background: C.accentBg, color: C.accent, padding: "4px 10px", fontSize: "12px", border: `1px solid ${C.accent}44` }}>+</button>
+          </div>
+          {materials.map((m, i) => (
+            <div key={i} style={{ display: "flex", gap: "5px", marginBottom: "6px", alignItems: "center" }}>
+              <input type="number" value={m.qty} onChange={e => updMat(i, "qty", e.target.value)}
+                placeholder="#" style={{ ...S.input, width: "48px", textAlign: "center", flexShrink: 0 }} />
+              <select value={m.unit} onChange={e => updMat(i, "unit", e.target.value)}
+                style={{ ...S.input, width: "65px", flexShrink: 0, padding: "9px 2px" }}>
+                {UNITS.map(u => <option key={u} value={u}>{u}</option>)}
+              </select>
+              <input type="text" value={m.name} onChange={e => updMat(i, "name", e.target.value)}
+                placeholder="z.B. Steckdose" style={{ ...S.input, flex: 1 }} />
+              <button onClick={() => delMat(i)} style={{ ...S.btn, background: "transparent", color: C.dim, padding: "2px 6px", fontSize: "16px", flexShrink: 0 }}>×</button>
+            </div>
+          ))}
+        </div>
+
+        {/* Generate */}
+        <button onClick={generate} disabled={!trade || !greekNotes.trim()} style={{
+          ...S.btn, width: "100%", padding: "14px", fontSize: "15px",
+          background: !trade || !greekNotes.trim() ? "#d6d3d1" : C.accent,
+          color: !trade || !greekNotes.trim() ? "#a8a29e" : "#fff",
+          cursor: !trade || !greekNotes.trim() ? "not-allowed" : "pointer",
+          boxShadow: !trade || !greekNotes.trim() ? "none" : "0 2px 8px rgba(196,122,10,0.25)",
+        }}>🤖 Rapport erstellen</button>
+      </div>
+    </div>
+  );
+}
